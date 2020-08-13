@@ -41,6 +41,8 @@ export class DynamoDBDataLoader implements AmplifyAppSyncSimulatorDataLoader {
           return await this.query(payload);
         case 'Scan':
           return await this.scan(payload);
+        case 'TransactWriteItems':
+          return await this.transactWriteItems(payload);
 
         case 'BatchGetItem':
         case 'BatchPutItem':
@@ -210,6 +212,74 @@ export class DynamoDBDataLoader implements AmplifyAppSyncSimulatorDataLoader {
       items: items.map(item => unmarshall(item)),
       scannedCount,
       nextToken: resultNextToken ? Buffer.from(JSON.stringify(resultNextToken)).toString('base64') : null,
+    };
+  }
+
+  private async executeTransactWrite(
+    client: DynamoDB,
+    params: DynamoDB.TransactWriteItemsInput,
+  ): Promise<DynamoDB.TransactWriteItemsOutput> {
+    const transactionRequest = client.transactWriteItems(params);
+    let cancellationReasons: any[];
+    transactionRequest.on('extractError', response => {
+      try {
+        cancellationReasons = JSON.parse(response.httpResponse.body.toString()).CancellationReasons;
+      } catch (err) {
+        // suppress this just in case some types of errors aren't JSON parseable
+        console.error('Error extracting cancellation error', err);
+      }
+    });
+    return new Promise((resolve, reject) => {
+      transactionRequest.send((err, response) => {
+        if (err) {
+          console.error('Error performing transactWrite', { cancellationReasons, err });
+          return reject(err);
+        }
+        return resolve(response);
+      });
+    });
+  }
+
+  private async transactWriteItems(payload) {
+    const { transactItems = [] } = payload;
+    const params = {
+      TransactItems: transactItems.map(ti => {
+        switch (ti.operation) {
+          case 'UpdateItem':
+            const { key, update = {}, condition = {} } = ti;
+            return {
+              Update: {
+                TableName: ti.tableName,
+                UpdateExpression: update.expression,
+                Key: key,
+                ReturnValuesOnConditionCheckFailure: String(condition.returnValuesOnConditionCheckFailure ?? 'NONE'), // Must be ALL_OLD or NONE
+                ConditionExpression: condition.expression,
+                ExpressionAttributeNames: {
+                  ...(condition.expressionNames || {}),
+                  ...update.expressionNames,
+                },
+                ExpressionAttributeValues: {
+                  ...(condition.expressionValues || {}),
+                  ...update.expressionValues,
+                },
+              },
+            };
+          case 'PutItem':
+          case 'DeleteItem':
+          case 'ConditionCheck':
+          default:
+            throw new Error('TODO');
+        }
+      }),
+    };
+    const { ItemCollectionMetrics: metrics } = await this.executeTransactWrite(this.client, params);
+    return {
+      itemKeys: Object.entries(metrics).map(([tableName, items]) => {
+        return {
+          tableName,
+          items: items.map(item => unmarshall(item.ItemCollectionKey)),
+        };
+      }),
     };
   }
 }
